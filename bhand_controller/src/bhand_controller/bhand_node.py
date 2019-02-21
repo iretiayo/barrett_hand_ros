@@ -36,7 +36,7 @@ from pyHand_api import *
 
 from std_msgs.msg import String
 from bhand_controller.msg import State, TactileArray, Service
-from bhand_controller.srv import Actions, SetControlMode
+from bhand_controller.srv import Actions, SetControlMode, CustomActions
 from sensor_msgs.msg import JointState
 
 import time, threading
@@ -127,6 +127,10 @@ class BHand:
 		# Timer to save the last command 
 		self.timer_command = time.time()
 		self.watchdog_command = float(WATCHDOG_VELOCITY)
+		self.operating_in_velocity_mode = False
+		self.target_spread = None
+		self.target_finger_joints = None
+		self.velocity_control_finger_joints_limit = None
 		
 		# List where saving the required actions
 		self.actions_list = []
@@ -214,6 +218,7 @@ class BHand:
 		
 		# SERVICES
 		self._hand_service = rospy.Service('%s/actions'%rospy.get_name(), Actions, self.handActions)
+		self._hand_service = rospy.Service('%s/custom_actions'%rospy.get_name(), CustomActions, self.handCustomActions)
 		self._set_control_mode_service = rospy.Service('%s/set_control_mode'%rospy.get_name(), SetControlMode, self.setControlModeServiceCb)
 	
 		self.ros_initialized = True
@@ -391,7 +396,135 @@ class BHand:
 		
 		return
 	
+	def setJointVelocityByValueALL(self, desired_joints_velocity_values=[0.0]*5):
+
+		try:
+			self.desired_joints_velocity[self.joint_names['F1'][0]] = desired_joints_velocity_values[0]
+			self.desired_joints_velocity[self.joint_names['F2'][0]] = desired_joints_velocity_values[1]
+			self.desired_joints_velocity[self.joint_names['F3'][0]] = desired_joints_velocity_values[2]
+			self.desired_joints_velocity[self.joint_names['SPREAD_1'][0]] = desired_joints_velocity_values[3]
+			self.desired_joints_velocity[self.joint_names['SPREAD_2'][0]] = desired_joints_velocity_values[4]
+			self.setJointVelocity('F1')
+			self.setJointVelocity('F2')
+			self.setJointVelocity('F3')
+			self.setJointVelocity('SPREAD_1')
+			self.setJointVelocity('SPREAD_2')
+		except Exception, e:
+			rospy.logerr('%s::setJointVelocityByValue: error sending command: %s'%(rospy.get_name(), e))
 	
+	def setJointVelocityByValue(self, desired_joints_velocity_values=[0.0]*5):
+
+		try:
+			if not self.desired_joints_velocity[self.joint_names['F1'][0]] == desired_joints_velocity_values[0]:
+				self.desired_joints_velocity[self.joint_names['F1'][0]] = desired_joints_velocity_values[0]
+				self.setJointVelocity('F1')
+				print('setting F1 to {}'.format(desired_joints_velocity_values[0]))
+			if not self.desired_joints_velocity[self.joint_names['F2'][0]] == desired_joints_velocity_values[1]:
+				self.desired_joints_velocity[self.joint_names['F2'][0]] = desired_joints_velocity_values[1]
+				self.setJointVelocity('F2')
+				print('setting F2 to {}'.format(desired_joints_velocity_values[1]))
+			if not self.desired_joints_velocity[self.joint_names['F3'][0]] == desired_joints_velocity_values[2]:
+				self.desired_joints_velocity[self.joint_names['F3'][0]] = desired_joints_velocity_values[2]
+				self.setJointVelocity('F3')
+				print('setting F3 to {}'.format(desired_joints_velocity_values[2]))
+		except Exception, e:
+			rospy.logerr('%s::setJointVelocityByValue: error sending command: %s'%(rospy.get_name(), e))
+	
+	def readFingerEfforts(self):
+		# update strain readings
+		f1_index = self.joint_names['F1'][1]
+		f2_index = self.joint_names['F2'][1]
+		f3_index = self.joint_names['F3'][1]
+		f1_tip_index = self.joint_names['F1_TIP'][1]
+		f2_tip_index = self.joint_names['F2_TIP'][1]
+		f3_tip_index = self.joint_names['F3_TIP'][1]
+		self.joint_state.effort[f1_index] = self.joint_state.effort[f1_tip_index] = self.strain_to_nm(self.hand.get_strain(FINGER1))
+		self.joint_state.effort[f2_index] = self.joint_state.effort[f2_tip_index] = self.strain_to_nm(self.hand.get_strain(FINGER2))
+		self.joint_state.effort[f3_index] = self.joint_state.effort[f3_tip_index] = self.strain_to_nm(self.hand.get_strain(FINGER3))
+
+		# rospy.loginfo('finger efforts')
+		# rospy.loginfo('F1: %s' % self.joint_state.effort[f1_index])
+		# rospy.loginfo('F2: %s' % self.joint_state.effort[f2_index])
+		# rospy.loginfo('F3: %s' % self.joint_state.effort[f3_index])
+		# rospy.loginfo(self.joint_state.effort)
+		return self.joint_state.effort
+	
+
+	def isFingerEffortSafe(self, f1_thresh, f2_thresh, f3_thresh):
+		self.readFingerEfforts()
+
+		return ((self.joint_state.effort[self.joint_names['F1'][1]] < f1_thresh) and  
+					(self.joint_state.effort[self.joint_names['F2'][1]] < f2_thresh) and 
+					(self.joint_state.effort[self.joint_names['F3'][1]] < f3_thresh))
+		
+	def velocityModeUpdate(self):
+		# read strain
+		efforts = self.readFingerEfforts()
+		# effort_threshold = [0.104328616481, 0.108447563614, 0.767480510171]
+		effort_threshold = [0.6, 0.6, 0.6]
+		
+		is_finger_below_target_position = [False, False, False]
+		close_velocity = self.velocity_control_finger_joints_limit[3] # max(-0.1, min(0.05, self.velocity_control_finger_joints_limit[3]))
+		if close_velocity > 0:
+			is_finger_below_target_position[0] = self.joint_state.position[self.joint_names['F1'][1]] < self.velocity_control_finger_joints_limit[0]
+			is_finger_below_target_position[1] = self.joint_state.position[self.joint_names['F2'][1]] < self.velocity_control_finger_joints_limit[1]
+			is_finger_below_target_position[2] = self.joint_state.position[self.joint_names['F3'][1]] < self.velocity_control_finger_joints_limit[2]
+		else:
+			is_finger_below_target_position[0] = self.joint_state.position[self.joint_names['F1'][1]] > self.velocity_control_finger_joints_limit[0]
+			is_finger_below_target_position[1] = self.joint_state.position[self.joint_names['F2'][1]] > self.velocity_control_finger_joints_limit[1]
+			is_finger_below_target_position[2] = self.joint_state.position[self.joint_names['F3'][1]] > self.velocity_control_finger_joints_limit[2]
+		
+		is_finger_below_target_effort = [False, False, False]
+		is_finger_below_target_effort[0] = self.joint_state.effort[self.joint_names['F1'][1]] < effort_threshold[0]
+		is_finger_below_target_effort[1] = self.joint_state.effort[self.joint_names['F2'][1]] < effort_threshold[1]
+		is_finger_below_target_effort[2] = self.joint_state.effort[self.joint_names['F3'][1]] < effort_threshold[2]
+		
+		
+		# import ipdb; ipdb.set_trace()
+		close_velocities = [close_velocity*is_finger_below_target_position[0]*is_finger_below_target_effort[0], 
+							close_velocity*is_finger_below_target_position[1]*is_finger_below_target_effort[1], 
+							close_velocity*is_finger_below_target_position[2]*is_finger_below_target_effort[2]]
+		self.setJointVelocityByValue(desired_joints_velocity_values=close_velocities+[0.0]*2)
+		# print('close_velocities', close_velocities)
+		
+		# if self.isFingerEffortSafe(effort_threshold[0], effort_threshold[1], effort_threshold[2]):
+		# 	# if strain is below threshold, set close joint velocity
+		# 	close_velocity = 0.05
+		# 	close_velocities = [close_velocity*is_finger_below_target_position[0]*is_finger_below_target_effort[0], 
+		# 						close_velocity*is_finger_below_target_position[1]*is_finger_below_target_effort[1], 
+		# 						close_velocity*is_finger_below_target_position[2]*is_finger_below_target_effort[2]]
+		# 	self.setJointVelocityByValue(desired_joints_velocity_values=close_velocities+[0.0]*2)
+		# else:
+		# 	# else, set release joint velocity
+		# 	release_velocity = 0 #-0.025
+		# 	self.setJointVelocityByValue(desired_joints_velocity_values=[release_velocity]*3+[0.0]*2)
+		# 	rospy.loginfo('releasing joint velocity')
+
+	def setSpread(self, value, action):
+		if (self.joint_state.position[self.joint_names['F1'][1]] > 0.1 or
+			self.joint_state.position[self.joint_names['F2'][1]] > 0.1 or
+			self.joint_state.position[self.joint_names['F3'][1]] > 0.1):
+			#rospy.logerr('BHand::ReadyState: Service SET_GRASP 1 cannot be performed. Rest of fingers have to be on zero position')
+			self.openFingers()
+			time.sleep(2.0)
+
+		self.desired_joints_position['SPREAD_1'] = value
+		self.desired_joints_position['SPREAD_2'] = value
+		self.hand.move_to(SPREAD, self.hand.rad_to_enc(self.desired_joints_position['SPREAD_1'], BASE_TYPE), False)
+		self.grasp_mode = action
+
+	def setFingerJoints(self, values, action):
+		'''
+			Closes all the fingers
+		'''
+		self.desired_joints_position['F1'] = values[0]
+		self.desired_joints_position['F2'] = values[1]
+		self.desired_joints_position['F3'] = values[2]
+		self.hand.move_to(FINGER1, self.hand.rad_to_enc(self.desired_joints_position['F1'], BASE_TYPE), False)
+		self.hand.move_to(FINGER2, self.hand.rad_to_enc(self.desired_joints_position['F2'], BASE_TYPE), False)
+		self.hand.move_to(FINGER3, self.hand.rad_to_enc(self.desired_joints_position['F3'], BASE_TYPE), False)
+		self.grasp_mode = action
+
 	def readyState(self):
 		'''
 			Actions performed in ready state
@@ -406,7 +539,7 @@ class BHand:
 		spread2_index = self.joint_names['SPREAD_2'][1]
 		errors = 0
 		
-		
+
 		try:
 			# Reads position
 			self.hand.read_packed_position(SPREAD)
@@ -443,15 +576,37 @@ class BHand:
 			rospy.logerr('%s::readyState: error getting info: %s'%(rospy.get_name(), e))
 			errors = errors + 1
 		
+		if self.operating_in_velocity_mode:
+			self.velocityModeUpdate()
 		# Predefined actions
 		if len(self.actions_list) > 0:
 			action = self.actions_list[0]
 			# Removes action from list 
 			self.actions_list.remove(action)
+
+			if action == Service.CLOSE_HAND_VELOCITY:
+				# import ipdb; ipdb.set_trace()
+				self.operating_in_velocity_mode = True
+				if self.control_mode == CONTROL_MODE_POSITION:
+					self.setControlMode(CONTROL_MODE_VELOCITY)
+					# current_spread = self.joint_state.position[self.joint_names['SPREAD_1'][0]]
+					current_spread, e = self.hand.get_packed_position(SPREAD)
+					self.setSpread(current_spread*0.45/math.pi, action)
+			else:
+				self.operating_in_velocity_mode = False
+				self.setJointVelocityByValue(desired_joints_velocity_values=[0.0]*5)
 			
-			# Actions performed in CONTROL POSITION
-			if self.control_mode == CONTROL_MODE_VELOCITY:
-				self.setControlMode(CONTROL_MODE_POSITION)
+				# Actions performed in CONTROL POSITION
+				if self.control_mode == CONTROL_MODE_VELOCITY:
+					self.setControlMode(CONTROL_MODE_POSITION)
+			
+			if action == Service.SET_SPREAD:
+				if self.target_spread is not None:
+					self.setSpread(self.target_spread, action)
+			
+			if action == Service.SET_FINGER_JOINTS:
+				if self.target_finger_joints:
+					self.setFingerJoints(self.target_finger_joints, action)
 			
 			if action == Service.CLOSE_GRASP:
 				self.closeFingers(3.14)
@@ -521,38 +676,38 @@ class BHand:
 					
 					self.new_command = False
 			
-			else:
-				# VELOCITY CONTROL
-				if ((time.time() - self.timer_command) >= self.watchdog_command):
-					try:
-						#rospy.loginfo('BHand::readyState: Watchdog velocity')
-						self.desired_joints_velocity[self.joint_names['F1'][0]] = 0.0
-						self.desired_joints_velocity[self.joint_names['F2'][0]] = 0.0
-						self.desired_joints_velocity[self.joint_names['F3'][0]] = 0.0
-						self.desired_joints_velocity[self.joint_names['SPREAD_1'][0]] = 0.0
-						self.desired_joints_velocity[self.joint_names['SPREAD_2'][0]] = 0.0
-						self.setJointVelocity('F1')
-						self.setJointVelocity('F2')
-						self.setJointVelocity('F3')
-						self.setJointVelocity('SPREAD_1')
-					except Exception, e:
-						rospy.logerr('%s::readyState: error sending command: %s'%(rospy.get_name(), e))
-						errors = errors + 1
-				# Moves joints to desired pos
-				if self.new_command:
+			# else:
+			# 	# VELOCITY CONTROL
+			# 	if ((time.time() - self.timer_command) >= self.watchdog_command):
+			# 		try:
+			# 			rospy.loginfo('BHand::readyState: Watchdog velocity')
+			# 			self.desired_joints_velocity[self.joint_names['F1'][0]] = 0.0
+			# 			self.desired_joints_velocity[self.joint_names['F2'][0]] = 0.0
+			# 			self.desired_joints_velocity[self.joint_names['F3'][0]] = 0.0
+			# 			self.desired_joints_velocity[self.joint_names['SPREAD_1'][0]] = 0.0
+			# 			self.desired_joints_velocity[self.joint_names['SPREAD_2'][0]] = 0.0
+			# 			self.setJointVelocity('F1')
+			# 			self.setJointVelocity('F2')
+			# 			self.setJointVelocity('F3')
+			# 			self.setJointVelocity('SPREAD_1')
+			# 		except Exception, e:
+			# 			rospy.logerr('%s::readyState: error sending command: %s'%(rospy.get_name(), e))
+			# 			errors = errors + 1
+			# 	# Moves joints to desired pos
+			# 	if self.new_command:
 			
-					try:
-						self.setJointVelocity('F1')
-						self.setJointVelocity('F2')
-						self.setJointVelocity('F3')
-						self.setJointVelocity('SPREAD_1')
+			# 		try:
+			# 			self.setJointVelocity('F1')
+			# 			self.setJointVelocity('F2')
+			# 			self.setJointVelocity('F3')
+			# 			self.setJointVelocity('SPREAD_1')
 						
 						
-					except Exception, e:
-						rospy.logerr('%s::readyState: error sending command: %s'%(rospy.get_name(), e))
-						errors = errors + 1
+			# 		except Exception, e:
+			# 			rospy.logerr('%s::readyState: error sending command: %s'%(rospy.get_name(), e))
+			# 			errors = errors + 1
 					
-					self.new_command = False
+			# 		self.new_command = False
 			
 		time.sleep(0.002)
 		
@@ -827,6 +982,45 @@ class BHand:
 		return nm
 		
 		
+	def handCustomActions(self, req):
+		'''
+		Handles the callback to Custom Actions ROS service. Allows a set of predefined actions that need parameters like set joint angles...
+
+		@param req: action id to perform and parameters
+		@type req: bhand_controller.srv.Actions
+
+		@returns: True or false depending on the result
+		'''
+		if req.action == Service.SET_SPREAD:
+			if len(req.parameters) == 2 and req.parameters[0]==req.parameters[1]:
+				self.target_spread = req.parameters[0]
+			else:
+				rospy.logerr('%s::handCustomActions: error on SET_SPREAD service. Spread values not correct'%rospy.get_name() )
+				return False
+
+		if req.action == Service.SET_FINGER_JOINTS:
+			if len(req.parameters) == 3:
+				self.target_finger_joints = req.parameters
+			else:
+				rospy.logerr('%s::handCustomActions: error on SET_FINGER_JOINTS service. Three joint values should be specified'%rospy.get_name() )
+				return False
+
+		if req.action == Service.CLOSE_HAND_VELOCITY:
+			if len(req.parameters) == 4:
+				self.velocity_control_finger_joints_limit = req.parameters
+			else:
+				rospy.logerr('%s::handCustomActions: error on CLOSE_HAND_VELOCITY service. Three joint values should be specified'%rospy.get_name() )
+				return False
+
+		if self.state != State.READY_STATE:
+			rospy.logerr('%s::handCustomActions: action not allowed in state %s'%(rospy.get_name(), self.stateToString(self.state)))
+			return False
+		else:
+			rospy.loginfo('%s::handCustomActions: Received new action %s'%(rospy.get_name(), self.actionsToString(req.action)))
+			self.actions_list.append(req.action)
+			
+		return True
+	
 	def handActions(self, req):
 		'''
 		Handles the callback to Actions ROS service. Allows a set of predefined actions like init_hand, close_grasp, ...
@@ -978,7 +1172,7 @@ def main():
 	  'tactile_sensors': True,
 	  'control_mode': 'POSITION',
 	  'joint_ids': [ 'F1', 'F1_TIP', 'F2', 'F2_TIP', 'F3', 'F3_TIP', 'SPREAD_1', 'SPREAD_2'],
-	  'joint_names': ['bh_j12_joint', 'bh_j13_joint', 'bh_j22_joint', 'bh_j23_joint', 'bh_j32_joint', 'bh_j31_joint', 'bh_j11_joint', 'bh_j21_joint']
+	  'joint_names': ['bh_j12_joint', 'bh_j13_joint', 'bh_j22_joint', 'bh_j23_joint', 'bh_j32_joint', 'bh_j33_joint', 'bh_j11_joint', 'bh_j21_joint']
 	}
 	
 	args = {}

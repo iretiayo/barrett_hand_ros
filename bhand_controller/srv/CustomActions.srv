@@ -1,0 +1,5 @@
+# Action ID defined in bhand/msg/Service.msg
+int32 action
+float32[] parameters
+---
+bool ret
